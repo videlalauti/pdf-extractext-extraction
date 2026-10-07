@@ -46,6 +46,13 @@ Ambos comandos se ejecutan en cada push y PR mediante GitHub Actions (`.github/w
 
 ## Variables de entorno
 
-| Variable                  | Descripción                                  | Valor por defecto        |
-| ------------------------- | -------------------------------------------- | ------------------------ |
-| `PERSISTENCE_SERVICE_URL` | URL base del servicio de persistencia        | `http://persistence-service:8000` |
+| Variable                        | Descripción                                  | Valor por defecto        |
+| ------------------------------- | -------------------------------------------- | ------------------------ |
+| `PERSISTENCE_SERVICE_URL`       | URL base del servicio de persistencia        | `http://persistence-service:8000` |
+| `REDIS_URL`                     | URL de Redis para la caché de extracción     | `redis://redis:6379/0`   |
+| `EXTRACTION_CACHE_TTL_SECONDS`  | TTL de la caché de resultados (segundos)     | `3600`                   |
+| `EXTRACTION_CACHE_ENABLED`      | Habilita la caché (`false` la desactiva)     | `true`                   |
+
+La caché es *cache-aside* y **fail-open**: si Redis no está disponible, el
+servicio extrae y persiste igual, solo loguea un warning. La clave es
+`extract:{sha256}` del PDF.

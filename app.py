@@ -8,16 +8,39 @@ from fastapi import HTTPException
 from pydantic_settings import BaseSettings
 from shared.web.resilience import CircuitBreaker, CircuitOpenError, retry_with_backoff
 
+from cache import ExtractionCache, NoopExtractionCache, RedisExtractionCache
+
 logger = logging.getLogger(__name__)
 
 SAFE_PERSISTENCE_ERROR = "No se pudo guardar el documento en persistence-service"
 
+DEFAULT_EXTRACTION_CACHE_TTL_SECONDS = 3600
+
 
 class Settings(BaseSettings):
     persistence_service_url: str = "http://persistence-service:8000"
+    redis_url: str = "redis://redis:6379/0"
+    extraction_cache_ttl_seconds: int = DEFAULT_EXTRACTION_CACHE_TTL_SECONDS
+    extraction_cache_enabled: bool = True
 
 
 settings = Settings()
+
+
+def build_extraction_cache(config: Settings) -> ExtractionCache:
+    """Compone la caché según config: habilitada → Redis, si no → Noop.
+
+    El flag permite desactivar la caché por env sin tocar código
+    (12-FACTOR: configuración en el entorno).
+    """
+    if not config.extraction_cache_enabled:
+        return NoopExtractionCache()
+    return RedisExtractionCache(config.redis_url, config.extraction_cache_ttl_seconds)
+
+
+# Accessor módulo-global, consistente con `settings`/`persistence_breaker`:
+# `routes.py` lo lee en tiempo de llamada y los tests lo monkeypatchean acá.
+extraction_cache: ExtractionCache = build_extraction_cache(settings)
 
 # Call timeout 120 s: cubre el peor caso de reintentos (3 x timeout httpx 30 s + sleeps).
 persistence_breaker = CircuitBreaker(

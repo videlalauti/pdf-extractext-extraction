@@ -1,9 +1,12 @@
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
+from fakes import FailingRedisClient, FakeExtractionCache
 from fastapi.testclient import TestClient
 
+import app as app_module
 import routes
+from cache import RedisExtractionCache
 from main import app
 
 client = TestClient(app)
@@ -110,3 +113,76 @@ def test_extract_oversized_file_returns_413(monkeypatch):
     )
 
     assert response.status_code == 413
+
+
+class _SpyExtractor:
+    """Extractor que registra cuántas veces se lo invocó."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def extract_text_from_bytes(self, pdf_bytes: bytes) -> str:
+        self.calls += 1
+        return "texto extraido"
+
+
+def test_extract_cache_hit_skips_extractor_and_persistence(monkeypatch):
+    checksum = app_module.compute_checksum(PDF)
+    payload = {"id": "doc-9", "content": "cacheado", "checksum": checksum, "text": "cacheado"}
+    cache = FakeExtractionCache({checksum: payload})
+    monkeypatch.setattr(app_module, "extraction_cache", cache)
+    spy = _SpyExtractor()
+    app.dependency_overrides[routes.get_extractor] = lambda: spy
+    post = AsyncMock(return_value=_http_response(201, PERSISTED))
+
+    with patch("httpx.AsyncClient.post", new=post):
+        response = client.post("/extract", files={"file": ("doc.pdf", PDF, "application/pdf")})
+
+    assert response.status_code == 200
+    assert response.json() == payload
+    assert spy.calls == 0
+    assert post.await_count == 0
+    assert cache.gets == [checksum]
+
+
+def test_extract_cache_miss_extracts_persists_and_caches(monkeypatch):
+    checksum = app_module.compute_checksum(PDF)
+    cache = FakeExtractionCache()
+    monkeypatch.setattr(app_module, "extraction_cache", cache)
+    post = AsyncMock(return_value=_http_response(201, PERSISTED))
+
+    with patch("httpx.AsyncClient.post", new=post):
+        response = client.post("/extract", files={"file": ("doc.pdf", PDF, "application/pdf")})
+
+    assert response.status_code == 200
+    assert post.await_count == 1
+    assert cache.gets == [checksum]
+    assert len(cache.sets) == 1
+    cached_checksum, payload = cache.sets[0]
+    assert cached_checksum == checksum
+    assert payload == response.json()
+
+
+def test_extract_with_failing_cache_still_returns_200(monkeypatch):
+    cache = RedisExtractionCache("redis://redis:6379/0", 3600, client=FailingRedisClient())
+    monkeypatch.setattr(app_module, "extraction_cache", cache)
+    post = AsyncMock(return_value=_http_response(201, PERSISTED))
+
+    with patch("httpx.AsyncClient.post", new=post):
+        response = client.post("/extract", files={"file": ("doc.pdf", PDF, "application/pdf")})
+
+    assert response.status_code == 200
+    assert post.await_count == 1
+
+
+def test_extract_cache_with_corrupted_payload_recomputes(monkeypatch):
+    checksum = app_module.compute_checksum(PDF)
+    cache = FakeExtractionCache({checksum: {"id": "doc-roto"}})
+    monkeypatch.setattr(app_module, "extraction_cache", cache)
+    post = AsyncMock(return_value=_http_response(201, PERSISTED))
+
+    with patch("httpx.AsyncClient.post", new=post):
+        response = client.post("/extract", files={"file": ("doc.pdf", PDF, "application/pdf")})
+
+    assert response.status_code == 200
+    assert post.await_count == 1

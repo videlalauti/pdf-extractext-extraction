@@ -4,7 +4,7 @@ import logging
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, status
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from shared.domain import (
     MAX_PDF_SIZE_BYTES,
     PdfExtractionError,
@@ -12,6 +12,7 @@ from shared.domain import (
     has_pdf_extension,
 )
 
+import app
 from app import compute_checksum, save_to_persistence
 
 logger = logging.getLogger(__name__)
@@ -59,17 +60,34 @@ async def extract_text(
 
     try:
         content = await _read_limited(file)
-        text = await extractor.extract_text_from_bytes(content)
-
         checksum = compute_checksum(content)
+
+        # Cache-aside: si el mismo PDF ya se extrajo (TTL de 1 h), el resultado
+        # cacheado se devuelve al instante sin pypdf ni persistence. El miss y
+        # el fail-open viven en el adaptador; acá solo se consume el puerto.
+        cached = await app.extraction_cache.get(checksum)
+        if cached is not None:
+            try:
+                response = ExtractionResponse(**cached)
+            except ValidationError:
+                logger.warning(
+                    "payload de caché inválido (checksum=%s); se recalcula", checksum
+                )
+            else:
+                logger.info("cache hit (checksum=%s); se omite pypdf y persistence", checksum)
+                return response
+
+        text = await extractor.extract_text_from_bytes(content)
         persistence_response = await save_to_persistence(text, checksum)
 
-        return ExtractionResponse(
+        response = ExtractionResponse(
             id=persistence_response.get("id"),
             content=persistence_response.get("content") or text,
             checksum=persistence_response.get("checksum") or checksum,
             text=text,
         )
+        await app.extraction_cache.set(checksum, response.model_dump())
+        return response
     except PdfExtractionError as error:
         logger.error("no se pudo extraer texto del PDF: %s", error)
         raise HTTPException(
