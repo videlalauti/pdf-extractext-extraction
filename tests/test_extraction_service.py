@@ -1,8 +1,9 @@
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
-from fakes import FailingRedisClient, FakeExtractionCache
+from fakes import FailingRedisClient, FakeEventPublisher, FakeExtractionCache
 from fastapi.testclient import TestClient
+from shared.web.logging import RequestIdMiddleware, TimingMiddleware
 
 import app as app_module
 import routes
@@ -57,6 +58,14 @@ def test_health_check():
     assert response.json()["service"] == "extraction-service"
 
 
+def test_timing_middleware_is_registered_inside_request_id():
+    registered = [middleware.cls for middleware in app.user_middleware]
+    assert TimingMiddleware in registered
+    # El menor índice es el más externo: RequestId debe correr antes que Timing
+    # para que el log de duración herede el request-id.
+    assert registered.index(RequestIdMiddleware) < registered.index(TimingMiddleware)
+
+
 def test_extract_valid_pdf_returns_document_and_text():
     post = AsyncMock(
         return_value=MagicMock(
@@ -88,6 +97,66 @@ def test_extract_duplicate_pdf_returns_existing_document():
     assert body["content"] == "texto previo"
     assert body["checksum"] == "abc"
     assert isinstance(body["text"], str)
+
+
+def test_extract_publishes_document_extracted_event(monkeypatch):
+    publisher = FakeEventPublisher()
+    monkeypatch.setattr(app_module, "event_publisher", publisher)
+    post = AsyncMock(
+        return_value=MagicMock(
+            status_code=201, json=lambda: PERSISTED, raise_for_status=lambda: None
+        )
+    )
+
+    with patch("httpx.AsyncClient.post", new=post):
+        response = client.post("/extract", files={"file": ("doc.pdf", PDF, "application/pdf")})
+
+    assert response.status_code == 200
+    assert publisher.events == [
+        {
+            "schema_version": 1,
+            "document_id": "doc-1",
+            "checksum": "abc",
+            "source": "extraction",
+        }
+    ]
+
+
+def test_extract_duplicate_pdf_publishes_event_for_existing_document(monkeypatch):
+    publisher = FakeEventPublisher()
+    monkeypatch.setattr(app_module, "event_publisher", publisher)
+    post = AsyncMock(return_value=_http_response(409))
+    existing = {"id": "doc-42", "content": "texto previo", "checksum": "abc"}
+    get = AsyncMock(return_value=_http_response(200, existing))
+
+    with patch("httpx.AsyncClient.post", new=post), patch("httpx.AsyncClient.get", new=get):
+        response = client.post("/extract", files={"file": ("doc.pdf", PDF, "application/pdf")})
+
+    assert response.status_code == 200
+    assert publisher.events == [
+        {
+            "schema_version": 1,
+            "document_id": "doc-42",
+            "checksum": "abc",
+            "source": "extraction",
+        }
+    ]
+
+
+def test_extract_survives_event_publisher_failure(monkeypatch):
+    publisher = FakeEventPublisher(fail=True)
+    monkeypatch.setattr(app_module, "event_publisher", publisher)
+    post = AsyncMock(
+        return_value=MagicMock(
+            status_code=201, json=lambda: PERSISTED, raise_for_status=lambda: None
+        )
+    )
+
+    with patch("httpx.AsyncClient.post", new=post):
+        response = client.post("/extract", files={"file": ("doc.pdf", PDF, "application/pdf")})
+
+    assert response.status_code == 200
+    assert response.json()["id"] == "doc-1"
 
 
 def test_extract_corrupt_pdf_returns_422_with_generic_detail():

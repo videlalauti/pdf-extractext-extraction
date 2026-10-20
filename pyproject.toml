@@ -1,3 +1,3 @@
 [tool.ruff.lint.isort]
-known-first-party = ["app", "cache", "routes", "main"]
+known-first-party = ["app", "cache", "events", "routes", "main"]
 known-third-party = ["shared"]

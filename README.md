@@ -52,7 +52,11 @@ Ambos comandos se ejecutan en cada push y PR mediante GitHub Actions (`.github/w
 | `REDIS_URL`                     | URL de Redis para la caché de extracción     | `redis://redis:6379/0`   |
 | `EXTRACTION_CACHE_TTL_SECONDS`  | TTL de la caché de resultados (segundos)     | `3600`                   |
 | `EXTRACTION_CACHE_ENABLED`      | Habilita la caché (`false` la desactiva)     | `true`                   |
+| `KAFKA_BOOTSTRAP_SERVERS`       | Bootstrap servers de Kafka para eventos      | `localhost:9092`         |
 
 La caché es *cache-aside* y **fail-open**: si Redis no está disponible, el
 servicio extrae y persiste igual, solo loguea un warning. La clave es
 `extract:{sha256}` del PDF.
+
+Los eventos `document.extracted` se publican en Kafka de forma **fail-open**: un
+broker caído solo deja un warning y la extracción responde igual.

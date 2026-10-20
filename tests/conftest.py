@@ -29,6 +29,18 @@ def _isolate_extraction_cache():
 
 
 @pytest.fixture(autouse=True)
+def _isolate_event_publisher():
+    """Publisher Noop por defecto: los tests no dependen de Kafka ni del broker."""
+    import app as app_module
+    from events import NoopEventPublisher
+
+    original = app_module.event_publisher
+    app_module.event_publisher = NoopEventPublisher()
+    yield
+    app_module.event_publisher = original
+
+
+@pytest.fixture(autouse=True)
 def _clear_dependency_overrides():
     from main import app
 

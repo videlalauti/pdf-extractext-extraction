@@ -9,6 +9,12 @@ from pydantic_settings import BaseSettings
 from shared.web.resilience import CircuitBreaker, CircuitOpenError, retry_with_backoff
 
 from cache import ExtractionCache, NoopExtractionCache, RedisExtractionCache
+from events import (
+    EventPublisher,
+    KafkaEventPublisher,
+    NoopEventPublisher,
+    build_document_extracted_event,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +28,7 @@ class Settings(BaseSettings):
     redis_url: str = "redis://redis:6379/0"
     extraction_cache_ttl_seconds: int = DEFAULT_EXTRACTION_CACHE_TTL_SECONDS
     extraction_cache_enabled: bool = True
+    kafka_bootstrap_servers: str = "localhost:9092"
 
 
 settings = Settings()
@@ -41,6 +48,16 @@ def build_extraction_cache(config: Settings) -> ExtractionCache:
 # Accessor módulo-global, consistente con `settings`/`persistence_breaker`:
 # `routes.py` lo lee en tiempo de llamada y los tests lo monkeypatchean acá.
 extraction_cache: ExtractionCache = build_extraction_cache(settings)
+
+
+def build_event_publisher(config: Settings) -> EventPublisher:
+    """Compone el publisher de eventos; el lifespan lo crea y lo cierra."""
+    return KafkaEventPublisher(config.kafka_bootstrap_servers)
+
+
+# Default seguro para imports y tests: el lifespan lo reemplaza por Kafka en
+# producción y los tests inyectan un fake.
+event_publisher: EventPublisher = NoopEventPublisher()
 
 # Call timeout 120 s: cubre el peor caso de reintentos (3 x timeout httpx 30 s + sleeps).
 persistence_breaker = CircuitBreaker(
@@ -94,6 +111,23 @@ async def _fetch_existing_document(checksum: str) -> dict:
             raise HTTPException(status_code=502, detail=SAFE_PERSISTENCE_ERROR) from error
 
 
+async def publish_document_extracted(document: dict) -> None:
+    """Publica ``document.extracted`` de forma fail-open.
+
+    El evento es best-effort: cualquier fallo del bus se loguea y se descarta,
+    porque el cliente ya obtuvo su respuesta y Kafka no debe ser motivo de 5xx.
+    """
+    try:
+        await event_publisher.publish(build_document_extracted_event(document))
+    except Exception as error:
+        logger.warning(
+            "no se pudo publicar document.extracted (document_id=%s); se ignora: %s",
+            document.get("id"),
+            type(error).__name__,
+            exc_info=True,
+        )
+
+
 async def save_to_persistence(content: str, checksum: str) -> dict:
     """Persiste el documento; un 409 por checksum es éxito (deduplicación idempotente).
 
@@ -101,6 +135,9 @@ async def save_to_persistence(content: str, checksum: str) -> dict:
     reenvían tal cual); el circuit breaker corta el tráfico si persistence cae.
     La recuperación por checksum tras un 409 va fuera del breaking y no se
     reintenta: un fallo ahí responde 502 y el cliente vuelve a enviar el PDF.
+
+    Una vez obtenido el document (creado o recuperado por 409), publica
+    ``document.extracted`` de forma fail-open y lo devuelve.
     """
     try:
         result = await persistence_breaker.call(
@@ -129,5 +166,9 @@ async def save_to_persistence(content: str, checksum: str) -> dict:
         raise HTTPException(status_code=502, detail=SAFE_PERSISTENCE_ERROR) from error
 
     if result is None:
-        return await _fetch_existing_document(checksum)
-    return result
+        document = await _fetch_existing_document(checksum)
+    else:
+        document = result
+
+    await publish_document_extracted(document)
+    return document

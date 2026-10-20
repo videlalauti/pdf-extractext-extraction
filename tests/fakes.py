@@ -58,3 +58,20 @@ class FailingRedisClient:
 def stored_payload(payload: dict) -> str:
     """Serializa un payload como lo haría el adaptador (JSON string)."""
     return json.dumps(payload)
+
+
+class FakeEventPublisher:
+    """Publisher en memoria: registra eventos y simula un broker caído con ``fail``."""
+
+    def __init__(self, fail: bool = False) -> None:
+        self.fail = fail
+        self.events: list[dict] = []
+        self.closed = False
+
+    async def publish(self, event: dict) -> None:
+        if self.fail:
+            raise ConnectionError("kafka caído")
+        self.events.append(event)
+
+    async def aclose(self) -> None:
+        self.closed = True
