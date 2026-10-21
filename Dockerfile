@@ -8,7 +8,7 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py app.py routes.py ./
+COPY main.py app.py routes.py cache.py events.py ./
 
 ARG PORT=8000
 ENV PORT=${PORT}

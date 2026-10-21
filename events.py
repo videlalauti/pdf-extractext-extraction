@@ -15,7 +15,7 @@ from aiokafka import AIOKafkaProducer
 
 logger = logging.getLogger(__name__)
 
-DOCUMENT_EXTRACTED_TOPIC = "document.extracted"
+DOCUMENT_EXTRACTED_TOPIC = "documents.extracted"
 EVENT_SCHEMA_VERSION = 1
 EVENT_SOURCE = "extraction"
 # Timeout acotado: si Kafka está caído, fallar rápido y seguir (fail-open) en
