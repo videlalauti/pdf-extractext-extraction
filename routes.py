@@ -1,6 +1,7 @@
 """Extraction service: endpoints HTTP delegando en extractor y lógica de aplicación."""
 
 import logging
+import time
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, status
@@ -20,6 +21,11 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 CHUNK_SIZE = 1024 * 1024
+
+
+def _elapsed_ms(started_at: float) -> float:
+    """Milisegundos transcurridos desde ``started_at`` (perf_counter)."""
+    return (time.perf_counter() - started_at) * 1000
 
 
 class ExtractionResponse(BaseModel):
@@ -74,11 +80,26 @@ async def extract_text(
                     "payload de caché inválido (checksum=%s); se recalcula", checksum
                 )
             else:
-                logger.info("cache hit (checksum=%s); se omite pypdf y persistence", checksum)
+                logger.info(
+                    "extraccion completada cache_hit=True pypdf_ms=%.2f persistence_ms=%.2f",
+                    0.0,
+                    0.0,
+                )
                 return response
 
+        pypdf_started = time.perf_counter()
         text = await extractor.extract_text_from_bytes(content)
+        pypdf_ms = _elapsed_ms(pypdf_started)
+
+        persistence_started = time.perf_counter()
         persistence_response = await save_to_persistence(text, checksum)
+        persistence_ms = _elapsed_ms(persistence_started)
+
+        logger.info(
+            "extraccion completada cache_hit=False pypdf_ms=%.2f persistence_ms=%.2f",
+            pypdf_ms,
+            persistence_ms,
+        )
 
         response = ExtractionResponse(
             id=persistence_response.get("id"),
