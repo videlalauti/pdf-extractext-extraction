@@ -1,3 +1,6 @@
+import asyncio
+import logging
+import re
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -50,6 +53,15 @@ def _persistence_post(response):
 def _http_response(status_code, payload=None):
     request = httpx.Request("POST", "http://persistence-service:8000/documents")
     return httpx.Response(status_code, json=payload, request=request)
+
+
+def _extraction_completed_messages(caplog):
+    messages = []
+    for record in caplog.records:
+        message = record.getMessage()
+        if record.name == "routes" and message.startswith("extraccion completada"):
+            messages.append(message)
+    return messages
 
 
 def test_health_check():
@@ -255,3 +267,60 @@ def test_extract_cache_with_corrupted_payload_recomputes(monkeypatch):
 
     assert response.status_code == 200
     assert post.await_count == 1
+
+
+def test_extract_cache_hit_logs_zero_timings(monkeypatch, caplog):
+    checksum = app_module.compute_checksum(PDF)
+    payload = {"id": "doc-9", "content": "cacheado", "checksum": checksum, "text": "cacheado"}
+    cache = FakeExtractionCache({checksum: payload})
+    monkeypatch.setattr(app_module, "extraction_cache", cache)
+
+    with caplog.at_level(logging.INFO, logger="routes"):
+        response = client.post("/extract", files={"file": ("doc.pdf", PDF, "application/pdf")})
+
+    assert response.status_code == 200
+    assert _extraction_completed_messages(caplog) == [
+        "extraccion completada cache_hit=True pypdf_ms=0.00 persistence_ms=0.00"
+    ]
+
+
+def test_extract_cache_miss_logs_nonzero_timings(monkeypatch, caplog):
+    """Aísla pypdf y persistence para medir los spans de instrumentación.
+
+    Los fakes lentos hacen determinista que ambos tiempos superen 0.00; el
+    retry y el 409 de persistence se cubren en los tests de app.
+    """
+    checksum = app_module.compute_checksum(PDF)
+    cache = FakeExtractionCache()
+    monkeypatch.setattr(app_module, "extraction_cache", cache)
+
+    class _SlowExtractor:
+        async def extract_text_from_bytes(self, pdf_bytes: bytes) -> str:
+            await asyncio.sleep(0.001)
+            return "texto extraido"
+
+    async def _slow_save(text: str, _checksum: str) -> dict:
+        await asyncio.sleep(0.001)
+        return dict(PERSISTED)
+
+    app.dependency_overrides[routes.get_extractor] = lambda: _SlowExtractor()
+    monkeypatch.setattr(routes, "save_to_persistence", _slow_save)
+
+    with caplog.at_level(logging.INFO, logger="routes"):
+        response = client.post("/extract", files={"file": ("doc.pdf", PDF, "application/pdf")})
+
+    assert response.status_code == 200
+    messages = _extraction_completed_messages(caplog)
+    assert len(messages) == 1
+    message = messages[0]
+    match = re.fullmatch(
+        r"extraccion completada cache_hit=False pypdf_ms=(\d+\.\d{2}) "
+        r"persistence_ms=(\d+\.\d{2})",
+        message,
+    )
+    assert match is not None
+    pypdf_ms, persistence_ms = (float(value) for value in match.groups())
+    assert pypdf_ms > 0
+    assert persistence_ms > 0
+    assert "checksum=" not in message
+    assert checksum not in message
