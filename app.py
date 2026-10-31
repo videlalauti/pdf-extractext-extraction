@@ -25,6 +25,9 @@ DEFAULT_EXTRACTION_CACHE_TTL_SECONDS = 3600
 
 class Settings(BaseSettings):
     persistence_service_url: str = "http://persistence-service:8000"
+    persistence_failure_threshold: int = 5
+    persistence_recovery_timeout_seconds: float = 30
+    persistence_call_timeout_seconds: float = 120
     redis_url: str = "redis://redis:6379/0"
     extraction_cache_ttl_seconds: int = DEFAULT_EXTRACTION_CACHE_TTL_SECONDS
     extraction_cache_enabled: bool = True
@@ -59,13 +62,22 @@ def build_event_publisher(config: Settings) -> EventPublisher:
 # producción y los tests inyectan un fake.
 event_publisher: EventPublisher = NoopEventPublisher()
 
-# Call timeout 120 s: cubre el peor caso de reintentos (3 x timeout httpx 30 s + sleeps).
-persistence_breaker = CircuitBreaker(
-    service="persistence",
-    failure_threshold=5,
-    recovery_timeout=30,
-    call_timeout=120,
-)
+
+def build_persistence_breaker(config: Settings) -> CircuitBreaker:
+    """Compone el breaker de persistence con los límites configurables.
+
+    El default de ``call_timeout`` (120 s) cubre el peor caso de reintentos:
+    3 x timeout httpx de 30 s + sleeps.
+    """
+    return CircuitBreaker(
+        service="persistence",
+        failure_threshold=config.persistence_failure_threshold,
+        recovery_timeout=config.persistence_recovery_timeout_seconds,
+        call_timeout=config.persistence_call_timeout_seconds,
+    )
+
+
+persistence_breaker = build_persistence_breaker(settings)
 
 
 def compute_checksum(content: bytes) -> str:

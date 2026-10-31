@@ -141,6 +141,44 @@ def _local_breaker(**overrides) -> CircuitBreaker:
     return CircuitBreaker(**params)
 
 
+def test_breaker_settings_default_to_current_values(monkeypatch):
+    for variable in (
+        "PERSISTENCE_FAILURE_THRESHOLD",
+        "PERSISTENCE_RECOVERY_TIMEOUT_SECONDS",
+        "PERSISTENCE_CALL_TIMEOUT_SECONDS",
+    ):
+        monkeypatch.delenv(variable, raising=False)
+
+    config = app.Settings()
+    breaker = app.build_persistence_breaker(config)
+
+    assert config.persistence_failure_threshold == 5
+    assert config.persistence_recovery_timeout_seconds == 30
+    assert config.persistence_call_timeout_seconds == 120
+    assert breaker.failure_threshold == 5
+    assert breaker.recovery_timeout == 30
+    assert breaker.call_timeout == 120
+    assert app.persistence_breaker.failure_threshold == 5
+    assert app.persistence_breaker.recovery_timeout == 30
+    assert app.persistence_breaker.call_timeout == 120
+
+
+def test_breaker_settings_read_environment_overrides(monkeypatch):
+    monkeypatch.setenv("PERSISTENCE_FAILURE_THRESHOLD", "2")
+    monkeypatch.setenv("PERSISTENCE_RECOVERY_TIMEOUT_SECONDS", "1.5")
+    monkeypatch.setenv("PERSISTENCE_CALL_TIMEOUT_SECONDS", "7.5")
+
+    config = app.Settings()
+    breaker = app.build_persistence_breaker(config)
+
+    assert config.persistence_failure_threshold == 2
+    assert config.persistence_recovery_timeout_seconds == 1.5
+    assert config.persistence_call_timeout_seconds == 7.5
+    assert breaker.failure_threshold == 2
+    assert breaker.recovery_timeout == 1.5
+    assert breaker.call_timeout == 7.5
+
+
 def test_breaker_opens_and_short_circuits_without_touching_peer(monkeypatch):
     breaker = _local_breaker(failure_threshold=1)
     monkeypatch.setattr(app, "persistence_breaker", breaker)
