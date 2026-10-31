@@ -12,6 +12,7 @@ import logging
 from typing import Protocol, runtime_checkable
 
 from aiokafka import AIOKafkaProducer
+from shared.web.logging import get_request_id
 
 logger = logging.getLogger(__name__)
 
@@ -49,13 +50,22 @@ class NoopEventPublisher:
 
 
 def build_document_extracted_event(document: dict) -> dict:
-    """Arma el evento ``document.extracted`` (schema v1) del documento persistido."""
-    return {
+    """Arma el evento ``document.extracted`` (schema v1) del documento persistido.
+
+    ``request_id`` es aditivo y opcional: solo aparece cuando el evento se
+    construye dentro de una request (``get_request_id() != "-"``). Por eso
+    ``schema_version`` se mantiene en 1.
+    """
+    event = {
         "schema_version": EVENT_SCHEMA_VERSION,
         "document_id": document["id"],
         "checksum": document["checksum"],
         "source": EVENT_SOURCE,
     }
+    request_id = get_request_id()
+    if request_id != "-":
+        event["request_id"] = request_id
+    return event
 
 
 class KafkaEventPublisher:
