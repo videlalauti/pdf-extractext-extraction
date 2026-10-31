@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 from fastapi import HTTPException
+from shared.web.logging import reset_request_id, set_request_id
 from shared.web.resilience import CircuitBreaker, CircuitState
 
 import app
@@ -52,7 +53,9 @@ def test_save_to_persistence_returns_response_on_first_attempt():
         result = asyncio.run(save_to_persistence(TEXT, CHECKSUM))
 
     assert result == PAYLOAD
-    post.assert_called_once_with(URL, json={"content": TEXT, "checksum": CHECKSUM})
+    post.assert_called_once_with(
+        URL, json={"content": TEXT, "checksum": CHECKSUM}, headers={}
+    )
 
 
 def test_save_to_persistence_retries_until_success():
@@ -97,8 +100,10 @@ def test_save_to_persistence_returns_existing_document_on_conflict():
         result = asyncio.run(save_to_persistence(TEXT, CHECKSUM))
 
     assert result == EXISTING
-    post.assert_awaited_once_with(URL, json={"content": TEXT, "checksum": CHECKSUM})
-    get.assert_awaited_once_with(BY_CHECKSUM_URL)
+    post.assert_awaited_once_with(
+        URL, json={"content": TEXT, "checksum": CHECKSUM}, headers={}
+    )
+    get.assert_awaited_once_with(BY_CHECKSUM_URL, headers={})
 
 
 def test_save_to_persistence_skips_conflict_lookup_without_conflict():
@@ -110,6 +115,41 @@ def test_save_to_persistence_skips_conflict_lookup_without_conflict():
 
     assert result == PAYLOAD
     get.assert_not_awaited()
+
+
+def test_save_to_persistence_forwards_request_id_to_post():
+    post = AsyncMock(return_value=_response(201, PAYLOAD))
+    token = set_request_id("req-post")
+    try:
+        with patch("httpx.AsyncClient.post", new=post):
+            result = asyncio.run(save_to_persistence(TEXT, CHECKSUM))
+    finally:
+        reset_request_id(token)
+
+    assert result == PAYLOAD
+    post.assert_awaited_once_with(
+        URL,
+        json={"content": TEXT, "checksum": CHECKSUM},
+        headers={"X-Request-Id": "req-post"},
+    )
+
+
+def test_save_to_persistence_forwards_request_id_to_get():
+    post = AsyncMock(return_value=_response(409))
+    get = AsyncMock(return_value=_response(200, EXISTING))
+    token = set_request_id("req-get")
+    try:
+        with patch("httpx.AsyncClient.post", new=post), patch(
+            "httpx.AsyncClient.get", new=get
+        ):
+            result = asyncio.run(save_to_persistence(TEXT, CHECKSUM))
+    finally:
+        reset_request_id(token)
+
+    assert result == EXISTING
+    get.assert_awaited_once_with(
+        BY_CHECKSUM_URL, headers={"X-Request-Id": "req-get"}
+    )
 
 
 @pytest.mark.parametrize("lookup_failure", [_connect_error(), _response(404)])

@@ -6,6 +6,7 @@ import logging
 import httpx
 from fastapi import HTTPException
 from pydantic_settings import BaseSettings
+from shared.web.logging import request_id_header
 from shared.web.resilience import CircuitBreaker, CircuitOpenError, retry_with_backoff
 
 from cache import ExtractionCache, NoopExtractionCache, RedisExtractionCache
@@ -94,7 +95,7 @@ async def _post_document(content: str, checksum: str) -> dict | None:
     url = f"{settings.persistence_service_url}/documents"
     payload = {"content": content, "checksum": checksum}
     async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.post(url, json=payload)
+        response = await client.post(url, json=payload, headers=request_id_header())
         if response.status_code == 409:
             return None
         response.raise_for_status()
@@ -111,7 +112,7 @@ async def _fetch_existing_document(checksum: str) -> dict:
     url = f"{settings.persistence_service_url}/documents/by-checksum/{checksum}"
     async with httpx.AsyncClient(timeout=30.0) as client:
         try:
-            response = await client.get(url)
+            response = await client.get(url, headers=request_id_header())
             response.raise_for_status()
             return response.json()
         except (httpx.RequestError, httpx.HTTPStatusError) as error:

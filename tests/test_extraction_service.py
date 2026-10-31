@@ -121,7 +121,11 @@ def test_extract_publishes_document_extracted_event(monkeypatch):
     )
 
     with patch("httpx.AsyncClient.post", new=post):
-        response = client.post("/extract", files={"file": ("doc.pdf", PDF, "application/pdf")})
+        response = client.post(
+            "/extract",
+            files={"file": ("doc.pdf", PDF, "application/pdf")},
+            headers={"X-Request-Id": "req-evento"},
+        )
 
     assert response.status_code == 200
     assert publisher.events == [
@@ -130,6 +134,7 @@ def test_extract_publishes_document_extracted_event(monkeypatch):
             "document_id": "doc-1",
             "checksum": "abc",
             "source": "extraction",
+            "request_id": "req-evento",
         }
     ]
 
@@ -142,7 +147,11 @@ def test_extract_duplicate_pdf_publishes_event_for_existing_document(monkeypatch
     get = AsyncMock(return_value=_http_response(200, existing))
 
     with patch("httpx.AsyncClient.post", new=post), patch("httpx.AsyncClient.get", new=get):
-        response = client.post("/extract", files={"file": ("doc.pdf", PDF, "application/pdf")})
+        response = client.post(
+            "/extract",
+            files={"file": ("doc.pdf", PDF, "application/pdf")},
+            headers={"X-Request-Id": "req-evento"},
+        )
 
     assert response.status_code == 200
     assert publisher.events == [
@@ -151,6 +160,7 @@ def test_extract_duplicate_pdf_publishes_event_for_existing_document(monkeypatch
             "document_id": "doc-42",
             "checksum": "abc",
             "source": "extraction",
+            "request_id": "req-evento",
         }
     ]
 

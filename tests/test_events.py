@@ -1,4 +1,5 @@
 from fakes import FakeEventPublisher
+from shared.web.logging import reset_request_id, set_request_id
 
 from events import (
     DOCUMENT_EXTRACTED_TOPIC,
@@ -21,6 +22,22 @@ def test_document_extracted_event_has_version_and_source():
         "document_id": "doc-1",
         "checksum": "abc123",
         "source": EVENT_SOURCE,
+    }
+
+
+def test_document_extracted_event_includes_request_id_in_context():
+    token = set_request_id("req-123")
+    try:
+        event = build_document_extracted_event(DOCUMENT)
+    finally:
+        reset_request_id(token)
+
+    assert event == {
+        "schema_version": EVENT_SCHEMA_VERSION,
+        "document_id": "doc-1",
+        "checksum": "abc123",
+        "source": EVENT_SOURCE,
+        "request_id": "req-123",
     }
 
 
