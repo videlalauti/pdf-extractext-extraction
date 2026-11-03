@@ -75,3 +75,18 @@ class FakeEventPublisher:
 
     async def aclose(self) -> None:
         self.closed = True
+
+
+class FlakyEventPublisher(FakeEventPublisher):
+    """Falla las primeras ``failures`` publicaciones y después registra el evento."""
+
+    def __init__(self, failures: int) -> None:
+        super().__init__()
+        self.failures = failures
+        self.attempts = 0
+
+    async def publish(self, event: dict) -> None:
+        self.attempts += 1
+        if self.attempts <= self.failures:
+            raise ConnectionError("kafka transitoriamente caído")
+        self.events.append(event)

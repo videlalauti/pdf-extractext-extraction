@@ -1,16 +1,30 @@
 """Tests de la capa de aplicación: checksum, reintentos y duplicados ante persistence-service."""
 
 import asyncio
-from unittest.mock import AsyncMock, patch
+import logging
+from functools import partial
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+from fakes import FlakyEventPublisher
 from fastapi import HTTPException
 from shared.web.logging import reset_request_id, set_request_id
-from shared.web.resilience import CircuitBreaker, CircuitState
+from shared.web.resilience import (
+    CircuitBreaker,
+    CircuitState,
+)
+from shared.web.resilience import (
+    retry_with_backoff as real_retry_with_backoff,
+)
 
 import app
-from app import compute_checksum, save_to_persistence, settings
+from app import (
+    compute_checksum,
+    publish_document_extracted,
+    save_to_persistence,
+    settings,
+)
 
 URL = f"{settings.persistence_service_url}/documents"
 BY_CHECKSUM_URL = f"{URL}/by-checksum/abc123"
@@ -30,6 +44,10 @@ def _connect_error() -> httpx.ConnectError:
     return httpx.ConnectError("connection refused", request=REQUEST)
 
 
+# Ejercita la política real de reintentos sin esperar los backoffs en los tests.
+_RETRY_WITHOUT_SLEEP = partial(real_retry_with_backoff, sleep=AsyncMock())
+
+
 def test_compute_checksum_matches_known_sha256_digest():
     assert compute_checksum(b"abc") == (
         "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
@@ -46,13 +64,63 @@ def test_compute_checksum_differs_for_different_input():
     assert compute_checksum(b"documento a") != compute_checksum(b"documento b")
 
 
+def test_persistence_client_uses_configured_timeout(monkeypatch):
+    monkeypatch.setattr(app.settings, "persistence_call_timeout_seconds", 7.5)
+    client_factory = MagicMock()
+
+    with patch("app.httpx.AsyncClient", new=client_factory):
+        app._persistence_client()
+
+    client_factory.assert_called_once_with(timeout=7.5)
+
+
+def test_publish_document_extracted_retries_until_success(monkeypatch):
+    publisher = FlakyEventPublisher(failures=2)
+    monkeypatch.setattr(app, "event_publisher", publisher)
+    monkeypatch.setattr(app, "retry_with_backoff", _RETRY_WITHOUT_SLEEP)
+
+    published = asyncio.run(publish_document_extracted(PAYLOAD))
+
+    assert published is True
+    assert publisher.attempts == 3
+    assert [event["document_id"] for event in publisher.events] == ["doc-1"]
+
+
+def test_publish_document_extracted_returns_false_after_retries(monkeypatch, caplog):
+    publisher = FlakyEventPublisher(failures=99)
+    monkeypatch.setattr(app, "event_publisher", publisher)
+    monkeypatch.setattr(app, "retry_with_backoff", _RETRY_WITHOUT_SLEEP)
+
+    with caplog.at_level(logging.ERROR, logger="app"):
+        published = asyncio.run(publish_document_extracted(PAYLOAD))
+
+    assert published is False
+    assert publisher.attempts == 3
+    assert any(record.levelno == logging.ERROR for record in caplog.records)
+
+
+def test_save_to_persistence_reports_summary_unavailable(monkeypatch):
+    publisher = FlakyEventPublisher(failures=99)
+    monkeypatch.setattr(app, "event_publisher", publisher)
+    monkeypatch.setattr(app, "retry_with_backoff", _RETRY_WITHOUT_SLEEP)
+    post = AsyncMock(return_value=_response(201, PAYLOAD))
+
+    with patch("httpx.AsyncClient.post", new=post):
+        result = asyncio.run(save_to_persistence(TEXT, CHECKSUM))
+
+    assert result.document == PAYLOAD
+    assert result.summary_enqueued is False
+    assert publisher.attempts == 3
+
+
 def test_save_to_persistence_returns_response_on_first_attempt():
     post = AsyncMock(return_value=_response(201, PAYLOAD))
 
     with patch("httpx.AsyncClient.post", new=post):
         result = asyncio.run(save_to_persistence(TEXT, CHECKSUM))
 
-    assert result == PAYLOAD
+    assert result.document == PAYLOAD
+    assert result.summary_enqueued is True
     post.assert_called_once_with(
         URL, json={"content": TEXT, "checksum": CHECKSUM}, headers={}
     )
@@ -64,7 +132,8 @@ def test_save_to_persistence_retries_until_success():
     with patch("httpx.AsyncClient.post", new=post):
         result = asyncio.run(save_to_persistence(TEXT, CHECKSUM))
 
-    assert result == PAYLOAD
+    assert result.document == PAYLOAD
+    assert result.summary_enqueued is True
     assert post.await_count == 3
 
 
@@ -99,7 +168,8 @@ def test_save_to_persistence_returns_existing_document_on_conflict():
     with patch("httpx.AsyncClient.post", new=post), patch("httpx.AsyncClient.get", new=get):
         result = asyncio.run(save_to_persistence(TEXT, CHECKSUM))
 
-    assert result == EXISTING
+    assert result.document == EXISTING
+    assert result.summary_enqueued is True
     post.assert_awaited_once_with(
         URL, json={"content": TEXT, "checksum": CHECKSUM}, headers={}
     )
@@ -113,7 +183,8 @@ def test_save_to_persistence_skips_conflict_lookup_without_conflict():
     with patch("httpx.AsyncClient.post", new=post), patch("httpx.AsyncClient.get", new=get):
         result = asyncio.run(save_to_persistence(TEXT, CHECKSUM))
 
-    assert result == PAYLOAD
+    assert result.document == PAYLOAD
+    assert result.summary_enqueued is True
     get.assert_not_awaited()
 
 
@@ -126,7 +197,8 @@ def test_save_to_persistence_forwards_request_id_to_post():
     finally:
         reset_request_id(token)
 
-    assert result == PAYLOAD
+    assert result.document == PAYLOAD
+    assert result.summary_enqueued is True
     post.assert_awaited_once_with(
         URL,
         json={"content": TEXT, "checksum": CHECKSUM},
@@ -146,7 +218,8 @@ def test_save_to_persistence_forwards_request_id_to_get():
     finally:
         reset_request_id(token)
 
-    assert result == EXISTING
+    assert result.document == EXISTING
+    assert result.summary_enqueued is True
     get.assert_awaited_once_with(
         BY_CHECKSUM_URL, headers={"X-Request-Id": "req-get"}
     )
@@ -256,6 +329,7 @@ def test_breaker_half_open_recovers_to_closed(monkeypatch):
     with patch("httpx.AsyncClient.post", new=post):
         result = asyncio.run(save_to_persistence(TEXT, CHECKSUM))
 
-    assert result == PAYLOAD
+    assert result.document == PAYLOAD
+    assert result.summary_enqueued is True
     assert breaker.state is CircuitState.CLOSED
     assert post.await_count == 4

@@ -1,3 +1,6 @@
+import asyncio
+
+import pytest
 from fakes import FakeEventPublisher
 from shared.web.logging import reset_request_id, set_request_id
 
@@ -55,3 +58,10 @@ def test_producer_publishes_to_the_topic_declared_by_infra():
 def test_noop_and_fake_implement_the_publisher_protocol():
     assert isinstance(NoopEventPublisher(), EventPublisher)
     assert isinstance(FakeEventPublisher(), EventPublisher)
+
+
+def test_kafka_publisher_propagates_failure_when_producer_is_unavailable():
+    publisher = KafkaEventPublisher("localhost:9092")
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(publisher.publish({"document_id": "doc-1"}))

@@ -2,6 +2,7 @@
 
 import hashlib
 import logging
+from dataclasses import dataclass
 
 import httpx
 from fastapi import HTTPException
@@ -20,8 +21,18 @@ from events import (
 logger = logging.getLogger(__name__)
 
 SAFE_PERSISTENCE_ERROR = "No se pudo guardar el documento en persistence-service"
+SAFE_VALIDATION_ERROR = "validation-service no disponible"
+VALIDATION_REJECTION_DETAIL = "El PDF no pasó la validación"
 
 DEFAULT_EXTRACTION_CACHE_TTL_SECONDS = 3600
+
+
+@dataclass(frozen=True)
+class PersistResult:
+    """Resultado de persistir: el documento y si el resumen quedó encolado."""
+
+    document: dict
+    summary_enqueued: bool
 
 
 class Settings(BaseSettings):
@@ -29,6 +40,8 @@ class Settings(BaseSettings):
     persistence_failure_threshold: int = 5
     persistence_recovery_timeout_seconds: float = 30
     persistence_call_timeout_seconds: float = 120
+    validation_service_url: str = "http://validation-service:8000"
+    validation_call_timeout_seconds: float = 10
     redis_url: str = "redis://redis:6379/0"
     extraction_cache_ttl_seconds: int = DEFAULT_EXTRACTION_CACHE_TTL_SECONDS
     extraction_cache_enabled: bool = True
@@ -67,8 +80,9 @@ event_publisher: EventPublisher = NoopEventPublisher()
 def build_persistence_breaker(config: Settings) -> CircuitBreaker:
     """Compone el breaker de persistence con los límites configurables.
 
-    El default de ``call_timeout`` (120 s) cubre el peor caso de reintentos:
-    3 x timeout httpx de 30 s + sleeps.
+    ``call_timeout`` y el timeout de cada llamada HTTP salen del mismo setting,
+    así que cambiarlo mueve ambos límites a la vez. Con el default de 120 s el
+    breaker corta la operación completa si los reintentos agotan ese presupuesto.
     """
     return CircuitBreaker(
         service="persistence",
@@ -86,6 +100,11 @@ def compute_checksum(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
+def _persistence_client() -> httpx.AsyncClient:
+    """Cliente HTTP hacia persistence con el timeout configurado por entorno."""
+    return httpx.AsyncClient(timeout=settings.persistence_call_timeout_seconds)
+
+
 async def _post_document(content: str, checksum: str) -> dict | None:
     """POST a /documents; devuelve None ante un 409 (checksum ya existente).
 
@@ -94,7 +113,7 @@ async def _post_document(content: str, checksum: str) -> dict | None:
     """
     url = f"{settings.persistence_service_url}/documents"
     payload = {"content": content, "checksum": checksum}
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with _persistence_client() as client:
         response = await client.post(url, json=payload, headers=request_id_header())
         if response.status_code == 409:
             return None
@@ -110,7 +129,7 @@ async def _fetch_existing_document(checksum: str) -> dict:
     ciclo empieza de nuevo.
     """
     url = f"{settings.persistence_service_url}/documents/by-checksum/{checksum}"
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with _persistence_client() as client:
         try:
             response = await client.get(url, headers=request_id_header())
             response.raise_for_status()
@@ -124,24 +143,86 @@ async def _fetch_existing_document(checksum: str) -> dict:
             raise HTTPException(status_code=502, detail=SAFE_PERSISTENCE_ERROR) from error
 
 
-async def publish_document_extracted(document: dict) -> None:
-    """Publica ``document.extracted`` de forma fail-open.
+def _validation_client() -> httpx.AsyncClient:
+    """Cliente HTTP hacia validation con el timeout configurado por entorno."""
+    return httpx.AsyncClient(timeout=settings.validation_call_timeout_seconds)
 
-    El evento es best-effort: cualquier fallo del bus se loguea y se descarta,
-    porque el cliente ya obtuvo su respuesta y Kafka no debe ser motivo de 5xx.
-    """
+
+def _validation_detail(response: httpx.Response) -> str:
+    """Extrae el ``detail`` del contrato de Validation sin romper si no es JSON."""
     try:
-        await event_publisher.publish(build_document_extracted_event(document))
-    except Exception as error:
-        logger.warning(
-            "no se pudo publicar document.extracted (document_id=%s); se ignora: %s",
-            document.get("id"),
-            type(error).__name__,
-            exc_info=True,
+        body = response.json()
+    except ValueError:
+        return VALIDATION_REJECTION_DETAIL
+    detail = body.get("detail") if isinstance(body, dict) else None
+    return detail if isinstance(detail, str) and detail else VALIDATION_REJECTION_DETAIL
+
+
+async def validate_with_validation_service(content: bytes, filename: str) -> None:
+    """Valida el PDF contra validation-service antes de extraer o persistir.
+
+    Fail-closed: si Validation rechaza o no está disponible, se levanta la
+    excepción HTTP correspondiente y el flujo no deja efectos laterales.
+    """
+    url = f"{settings.validation_service_url}/validate"
+    try:
+        async with _validation_client() as client:
+            response = await client.post(
+                url,
+                files={"file": (filename, content, "application/pdf")},
+                headers=request_id_header(),
+            )
+    except httpx.RequestError as error:
+        logger.error("validation-service inalcanzable: %s", type(error).__name__)
+        raise HTTPException(status_code=503, detail=SAFE_VALIDATION_ERROR) from error
+
+    if response.status_code == 200:
+        return
+
+    if response.status_code in (400, 413, 415):
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=_validation_detail(response),
         )
 
+    logger.error("validation-service respondió %s", response.status_code)
+    raise HTTPException(status_code=503, detail=SAFE_VALIDATION_ERROR)
 
-async def save_to_persistence(content: str, checksum: str) -> dict:
+
+async def _publish_extracted_event(document: dict) -> None:
+    """Publica un evento ya construido; deja que el error llegue al reintento."""
+    await event_publisher.publish(build_document_extracted_event(document))
+
+
+async def publish_document_extracted(document: dict) -> bool:
+    """Publica ``document.extracted`` con reintentos y sin romper la response.
+
+    El documento ya está persistido, así que un 5xx acá mentiría sobre el
+    resultado. Se reintenta con backoff y, si se agotan los intentos, se
+    devuelve ``False`` para que el cliente sepa que el resumen no quedó
+    encolado y pueda pedirlo explícitamente con ``POST /summary/{id}``.
+    """
+    try:
+        await retry_with_backoff(
+            _publish_extracted_event,
+            document,
+            attempts=3,
+            base_delay=0.5,
+            max_delay=2,
+            retry_on=(Exception,),
+        )
+    except Exception as error:
+        logger.exception(
+            "no se pudo publicar document.extracted tras 3 intentos "
+            "(document_id=%s); el resumen no quedó encolado: %s",
+            document.get("id"),
+            type(error).__name__,
+        )
+        return False
+    return True
+
+
+async def save_to_persistence(content: str, checksum: str) -> PersistResult:
     """Persiste el documento; un 409 por checksum es éxito (deduplicación idempotente).
 
     El backoff con jitter cadena solo los errores transitorios del POST (4xx se
@@ -150,7 +231,7 @@ async def save_to_persistence(content: str, checksum: str) -> dict:
     reintenta: un fallo ahí responde 502 y el cliente vuelve a enviar el PDF.
 
     Una vez obtenido el document (creado o recuperado por 409), publica
-    ``document.extracted`` de forma fail-open y lo devuelve.
+    ``document.extracted`` y reporta si el resumen quedó encolado.
     """
     try:
         result = await persistence_breaker.call(
@@ -183,5 +264,5 @@ async def save_to_persistence(content: str, checksum: str) -> dict:
     else:
         document = result
 
-    await publish_document_extracted(document)
-    return document
+    summary_enqueued = await publish_document_extracted(document)
+    return PersistResult(document=document, summary_enqueued=summary_enqueued)

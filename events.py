@@ -2,8 +2,9 @@
 
 El servicio depende del Protocol :class:`EventPublisher`, nunca de ``aiokafka``:
 la dependencia se inyecta en la composición (módulo ``app``) y los tests usan
-fakes. El adaptador Kafka es *fail-open*: si el broker no está disponible, se
-loguea un warning y el request de extracción sigue su curso.
+fakes. El adaptador Kafka propaga los errores de publicación; la política
+*fail-open* (reintentos y respuesta 200 con ``summary_status``) vive en la capa
+de aplicación, que es la única que puede decidir qué contarle al cliente.
 """
 
 import contextlib
@@ -71,8 +72,8 @@ def build_document_extracted_event(document: dict) -> dict:
 class KafkaEventPublisher:
     """Adaptador de :class:`EventPublisher` sobre aiokafka.
 
-    Fail-open: un broker caído se reporta como warning y el evento se descarta;
-    la extracción y la respuesta al cliente no dependen de Kafka.
+    Propaga los errores en vez de descartarlos: la capa de aplicación decide si
+    reintenta y cómo reporta el estado del resumen al cliente.
     """
 
     def __init__(
@@ -106,24 +107,10 @@ class KafkaEventPublisher:
 
     async def publish(self, event: dict) -> None:
         if self._producer is None:
-            logger.warning(
-                "Kafka no disponible; se descarta %s (document_id=%s)",
-                DOCUMENT_EXTRACTED_TOPIC,
-                event.get("document_id"),
-            )
-            return
-        try:
-            await self._producer.send_and_wait(
-                self._topic, value=json.dumps(event).encode("utf-8")
-            )
-        except Exception as error:
-            logger.warning(
-                "no se pudo publicar %s (document_id=%s); se ignora: %s",
-                self._topic,
-                event.get("document_id"),
-                type(error).__name__,
-                exc_info=True,
-            )
+            raise RuntimeError("Kafka no disponible: no hay producer conectado")
+        await self._producer.send_and_wait(
+            self._topic, value=json.dumps(event).encode("utf-8")
+        )
 
     async def aclose(self) -> None:
         if self._producer is None:

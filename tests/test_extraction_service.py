@@ -1,12 +1,15 @@
 import asyncio
 import logging
 import re
+from functools import partial
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
+import pytest
 from fakes import FailingRedisClient, FakeEventPublisher, FakeExtractionCache
 from fastapi.testclient import TestClient
 from shared.web.logging import RequestIdMiddleware, TimingMiddleware
+from shared.web.resilience import retry_with_backoff as real_retry_with_backoff
 
 import app as app_module
 import routes
@@ -45,6 +48,9 @@ startxref
 
 PERSISTED = {"id": "doc-1", "content": "", "checksum": "abc"}
 
+# Ejercita la política real de reintentos sin esperar los backoffs en los tests.
+_RETRY_WITHOUT_SLEEP = partial(real_retry_with_backoff, sleep=AsyncMock())
+
 
 def _persistence_post(response):
     return patch("httpx.AsyncClient.post", new=AsyncMock(return_value=response))
@@ -53,6 +59,15 @@ def _persistence_post(response):
 def _http_response(status_code, payload=None):
     request = httpx.Request("POST", "http://persistence-service:8000/documents")
     return httpx.Response(status_code, json=payload, request=request)
+
+
+def _validation_response(status_code, payload=None):
+    request = httpx.Request("POST", "http://validation-service:8000/validate")
+    return httpx.Response(status_code, json=payload, request=request)
+
+
+def _validation_request():
+    return httpx.Request("POST", "http://validation-service:8000/validate")
 
 
 def _extraction_completed_messages(caplog):
@@ -89,10 +104,11 @@ def test_extract_valid_pdf_returns_document_and_text():
 
     assert response.status_code == 200
     body = response.json()
-    assert set(body) == {"id", "content", "checksum", "text"}
+    assert set(body) == {"id", "content", "checksum", "text", "summary_status"}
     assert body["id"] == "doc-1"
     assert body["checksum"] == "abc"
     assert isinstance(body["text"], str)
+    assert body["summary_status"] == "queued"
 
 
 def test_extract_duplicate_pdf_returns_existing_document():
@@ -168,6 +184,7 @@ def test_extract_duplicate_pdf_publishes_event_for_existing_document(monkeypatch
 def test_extract_survives_event_publisher_failure(monkeypatch):
     publisher = FakeEventPublisher(fail=True)
     monkeypatch.setattr(app_module, "event_publisher", publisher)
+    monkeypatch.setattr(app_module, "retry_with_backoff", _RETRY_WITHOUT_SLEEP)
     post = AsyncMock(
         return_value=MagicMock(
             status_code=201, json=lambda: PERSISTED, raise_for_status=lambda: None
@@ -178,7 +195,9 @@ def test_extract_survives_event_publisher_failure(monkeypatch):
         response = client.post("/extract", files={"file": ("doc.pdf", PDF, "application/pdf")})
 
     assert response.status_code == 200
-    assert response.json()["id"] == "doc-1"
+    body = response.json()
+    assert body["id"] == "doc-1"
+    assert body["summary_status"] == "unavailable"
 
 
 def test_extract_corrupt_pdf_returns_422_with_generic_detail():
@@ -206,6 +225,121 @@ def test_extract_oversized_file_returns_413(monkeypatch):
     assert response.status_code == 413
 
 
+def test_upload_valid_pdf_validates_extracts_persists_and_publishes(monkeypatch):
+    publisher = FakeEventPublisher()
+    monkeypatch.setattr(app_module, "event_publisher", publisher)
+    post = AsyncMock(
+        side_effect=[
+            _validation_response(200, {"valid": True, "error": None}),
+            _http_response(201, PERSISTED),
+        ]
+    )
+
+    with patch("httpx.AsyncClient.post", new=post):
+        response = client.post("/upload", files={"file": ("doc.pdf", PDF, "application/pdf")})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["id"] == "doc-1"
+    assert body["summary_status"] == "queued"
+    assert post.await_count == 2
+    assert post.await_args_list[0].args == ("http://validation-service:8000/validate",)
+    assert [event["document_id"] for event in publisher.events] == ["doc-1"]
+
+
+@pytest.mark.parametrize(
+    ("status_code", "detail"),
+    [
+        (400, "El archivo no tiene un formato PDF válido"),
+        (413, "El archivo excede el tamaño máximo de 10 bytes"),
+        (415, "El archivo debe tener extensión .pdf"),
+    ],
+)
+def test_upload_forwards_validation_rejections(status_code, detail):
+    publisher = FakeEventPublisher()
+    post = AsyncMock(return_value=_validation_response(status_code, {"detail": detail}))
+
+    with patch("httpx.AsyncClient.post", new=post), patch(
+        "app.event_publisher", new=publisher
+    ):
+        response = client.post("/upload", files={"file": ("doc.pdf", PDF, "application/pdf")})
+
+    assert response.status_code == status_code
+    assert response.json()["detail"] == detail
+    assert post.await_count == 1
+    assert publisher.events == []
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        httpx.ConnectError("connection refused", request=_validation_request()),
+        httpx.ReadTimeout("timeout", request=_validation_request()),
+        _validation_response(503, {"detail": "boom"}),
+    ],
+)
+def test_upload_returns_503_when_validation_is_unavailable(failure):
+    publisher = FakeEventPublisher()
+    post = AsyncMock(side_effect=[failure])
+
+    with patch("httpx.AsyncClient.post", new=post), patch(
+        "app.event_publisher", new=publisher
+    ):
+        response = client.post("/upload", files={"file": ("doc.pdf", PDF, "application/pdf")})
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "validation-service no disponible"
+    assert post.await_count == 1
+    assert publisher.events == []
+
+
+def test_upload_duplicate_pdf_returns_existing_document(monkeypatch):
+    publisher = FakeEventPublisher()
+    monkeypatch.setattr(app_module, "event_publisher", publisher)
+    existing = {"id": "doc-42", "content": "texto previo", "checksum": "abc"}
+    post = AsyncMock(
+        side_effect=[
+            _validation_response(200, {"valid": True, "error": None}),
+            _http_response(409),
+        ]
+    )
+    get = AsyncMock(return_value=_http_response(200, existing))
+
+    with patch("httpx.AsyncClient.post", new=post), patch("httpx.AsyncClient.get", new=get):
+        response = client.post("/upload", files={"file": ("doc.pdf", PDF, "application/pdf")})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["id"] == "doc-42"
+    assert body["content"] == "texto previo"
+    assert [event["document_id"] for event in publisher.events] == ["doc-42"]
+
+
+def test_upload_non_pdf_returns_415_without_calling_validation():
+    post = AsyncMock()
+
+    with patch("httpx.AsyncClient.post", new=post):
+        response = client.post(
+            "/upload", files={"file": ("doc.txt", b"not a pdf", "text/plain")}
+        )
+
+    assert response.status_code == 415
+    post.assert_not_awaited()
+
+
+def test_upload_oversized_file_returns_413_without_calling_validation(monkeypatch):
+    monkeypatch.setattr(routes, "MAX_PDF_SIZE_BYTES", 100)
+    post = AsyncMock()
+
+    with patch("httpx.AsyncClient.post", new=post):
+        response = client.post(
+            "/upload", files={"file": ("doc.pdf", b"x" * (200 * 1024), "application/pdf")}
+        )
+
+    assert response.status_code == 413
+    post.assert_not_awaited()
+
+
 class _SpyExtractor:
     """Extractor que registra cuántas veces se lo invocó."""
 
@@ -230,10 +364,41 @@ def test_extract_cache_hit_skips_extractor_and_persistence(monkeypatch):
         response = client.post("/extract", files={"file": ("doc.pdf", PDF, "application/pdf")})
 
     assert response.status_code == 200
-    assert response.json() == payload
+    assert response.json() == {**payload, "summary_status": "queued"}
     assert spy.calls == 0
     assert post.await_count == 0
     assert cache.gets == [checksum]
+
+
+def test_extract_cache_hit_republishes_document_extracted(monkeypatch):
+    checksum = app_module.compute_checksum(PDF)
+    payload = {"id": "doc-9", "content": "cacheado", "checksum": checksum, "text": "cacheado"}
+    cache = FakeExtractionCache({checksum: payload})
+    monkeypatch.setattr(app_module, "extraction_cache", cache)
+    publisher = FakeEventPublisher()
+    monkeypatch.setattr(app_module, "event_publisher", publisher)
+
+    response = client.post("/extract", files={"file": ("doc.pdf", PDF, "application/pdf")})
+
+    assert response.status_code == 200
+    assert response.json()["summary_status"] == "queued"
+    assert [event["document_id"] for event in publisher.events] == ["doc-9"]
+
+
+def test_extract_cache_hit_survives_event_publisher_failure(monkeypatch):
+    checksum = app_module.compute_checksum(PDF)
+    payload = {"id": "doc-9", "content": "cacheado", "checksum": checksum, "text": "cacheado"}
+    cache = FakeExtractionCache({checksum: payload})
+    monkeypatch.setattr(app_module, "extraction_cache", cache)
+    monkeypatch.setattr(app_module, "event_publisher", FakeEventPublisher(fail=True))
+    monkeypatch.setattr(app_module, "retry_with_backoff", _RETRY_WITHOUT_SLEEP)
+
+    response = client.post("/extract", files={"file": ("doc.pdf", PDF, "application/pdf")})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["id"] == "doc-9"
+    assert body["summary_status"] == "unavailable"
 
 
 def test_extract_cache_miss_extracts_persists_and_caches(monkeypatch):
@@ -309,9 +474,9 @@ def test_extract_cache_miss_logs_nonzero_timings(monkeypatch, caplog):
             await asyncio.sleep(0.001)
             return "texto extraido"
 
-    async def _slow_save(text: str, _checksum: str) -> dict:
+    async def _slow_save(text: str, _checksum: str) -> app_module.PersistResult:
         await asyncio.sleep(0.001)
-        return dict(PERSISTED)
+        return app_module.PersistResult(document=dict(PERSISTED), summary_enqueued=True)
 
     app.dependency_overrides[routes.get_extractor] = lambda: _SlowExtractor()
     monkeypatch.setattr(routes, "save_to_persistence", _slow_save)
