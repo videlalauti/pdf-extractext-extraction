@@ -1,4 +1,5 @@
 import asyncio
+from unittest.mock import AsyncMock
 
 import pytest
 from fakes import FakeEventPublisher
@@ -60,8 +61,43 @@ def test_noop_and_fake_implement_the_publisher_protocol():
     assert isinstance(FakeEventPublisher(), EventPublisher)
 
 
-def test_kafka_publisher_propagates_failure_when_producer_is_unavailable():
+def test_kafka_publisher_propagates_failure_when_producer_is_unavailable(monkeypatch):
+    class OfflineProducer:
+        def __init__(self, **kwargs):
+            self.stop = AsyncMock()
+
+        async def start(self):
+            raise OSError("broker offline")
+
+    monkeypatch.setattr("events.AIOKafkaProducer", OfflineProducer)
     publisher = KafkaEventPublisher("localhost:9092")
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError, match="Kafka no disponible"):
         asyncio.run(publisher.publish({"document_id": "doc-1"}))
+
+
+def test_kafka_publisher_recovers_after_failed_start(monkeypatch):
+    producers = []
+
+    class Producer:
+        def __init__(self, **kwargs):
+            self.start = AsyncMock(side_effect=OSError("offline") if not producers else None)
+            self.send_and_wait = AsyncMock()
+            self.stop = AsyncMock()
+            producers.append(self)
+
+    monkeypatch.setattr("events.AIOKafkaProducer", Producer)
+    publisher = KafkaEventPublisher("localhost:9092")
+
+    async def scenario():
+        await publisher.start()
+        assert publisher._producer is None
+        await publisher.publish({"document_id": "doc-1"})
+        await publisher.aclose()
+
+    asyncio.run(scenario())
+
+    assert len(producers) == 2
+    producers[0].stop.assert_awaited_once()
+    producers[1].send_and_wait.assert_awaited_once()
+
