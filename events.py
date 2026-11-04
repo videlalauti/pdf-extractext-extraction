@@ -97,7 +97,7 @@ class KafkaEventPublisher:
                     request_timeout_ms=KAFKA_REQUEST_TIMEOUT_MS,
                 )
                 await producer.start()
-            except Exception as error:
+            except Exception as error:  # noqa: BLE001 - errores del broker en startup
                 logger.warning(
                     "Kafka no disponible (%s): %s",
                     self._bootstrap_servers,
