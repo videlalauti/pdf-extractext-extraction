@@ -7,6 +7,7 @@ fakes. El adaptador Kafka propaga los errores de publicación; la política
 de aplicación, que es la única que puede decidir qué contarle al cliente.
 """
 
+import asyncio
 import contextlib
 import json
 import logging
@@ -82,30 +83,37 @@ class KafkaEventPublisher:
         self._bootstrap_servers = bootstrap_servers
         self._topic = topic
         self._producer: AIOKafkaProducer | None = None
+        self._connect_lock = asyncio.Lock()
 
     async def start(self) -> None:
-        """Conecta el producer; si el broker no responde, sigue sin él."""
-        producer: AIOKafkaProducer | None = None
-        try:
-            producer = AIOKafkaProducer(
-                bootstrap_servers=self._bootstrap_servers,
-                request_timeout_ms=KAFKA_REQUEST_TIMEOUT_MS,
-            )
-            await producer.start()
-        except Exception as error:
-            logger.warning(
-                "Kafka no disponible (%s); se publicará sin broker: %s",
-                self._bootstrap_servers,
-                type(error).__name__,
-                exc_info=True,
-            )
-            if producer is not None:
-                with contextlib.suppress(Exception):
-                    await producer.stop()
-            return
-        self._producer = producer
+        """Conecta cuando se necesita; otros requests esperan el mismo intento."""
+        async with self._connect_lock:
+            if self._producer is not None:
+                return
+            producer: AIOKafkaProducer | None = None
+            try:
+                producer = AIOKafkaProducer(
+                    bootstrap_servers=self._bootstrap_servers,
+                    request_timeout_ms=KAFKA_REQUEST_TIMEOUT_MS,
+                )
+                await producer.start()
+            except Exception as error:  # noqa: BLE001 - errores del broker en startup
+                logger.warning(
+                    "Kafka no disponible (%s): %s",
+                    self._bootstrap_servers,
+                    type(error).__name__,
+                )
+                if producer is not None:
+                    with contextlib.suppress(Exception):
+                        await producer.stop()
+                return
+            self._producer = producer
 
     async def publish(self, event: dict) -> None:
+        # Si el arranque falló, cada publicación puede reintentar la conexión;
+        # el lock impide crear varios productores simultáneamente.
+        if self._producer is None:
+            await self.start()
         if self._producer is None:
             raise RuntimeError("Kafka no disponible: no hay producer conectado")
         await self._producer.send_and_wait(
